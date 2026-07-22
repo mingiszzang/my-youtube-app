@@ -1,11 +1,13 @@
 import re
 from collections import Counter
-from urllib.parse import urlparse, parse_qs
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+from wordcloud import WordCloud
 
 
 # =========================================================
@@ -22,13 +24,22 @@ EXAMPLE_2_URL = "https://youtu.be/I9vK5EVTt0U?si=NEZ8L7MRuNvrzINa"
 
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/commentThreads"
 
+# 한글 워드클라우드에 사용할 나눔고딕 폰트 주소입니다.
+FONT_URL = (
+    "https://raw.githubusercontent.com/google/fonts/"
+    "main/ofl/nanumgothic/NanumGothic-Regular.ttf"
+)
+
+# Streamlit Cloud에서 임시로 폰트를 저장할 위치입니다.
+FONT_PATH = Path("/tmp/NanumGothic-Regular.ttf")
+
 
 # =========================================================
 # 유튜브 링크에서 영상 ID 추출
 # =========================================================
 def extract_video_id(url: str) -> str | None:
     """
-    유튜브 주소에서 11자리 영상 ID를 추출합니다.
+    여러 형태의 유튜브 주소에서 11자리 영상 ID를 추출합니다.
 
     처리 가능한 주소 예시
     - https://youtu.be/영상ID
@@ -73,7 +84,7 @@ def extract_video_id(url: str) -> str | None:
         else:
             video_id = None
 
-        # 유튜브 영상 ID가 올바른 11자리인지 확인합니다.
+        # 유튜브 영상 ID는 일반적으로 11자리입니다.
         if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
             return video_id
 
@@ -125,12 +136,14 @@ def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
 
         if error_reason == "commentsDisabled":
             raise ValueError(
-                "이 영상은 댓글 사용이 중지되어 있어 댓글을 가져올 수 없습니다."
+                "이 영상은 댓글 사용이 중지되어 있어 "
+                "댓글을 가져올 수 없습니다."
             )
 
         if error_reason in {"videoNotFound", "forbidden"}:
             raise ValueError(
-                "영상을 찾을 수 없습니다. 비공개 또는 삭제된 영상인지 확인해 주세요."
+                "영상을 찾을 수 없습니다. "
+                "비공개 또는 삭제된 영상인지 확인해 주세요."
             )
 
         if error_reason in {
@@ -164,6 +177,7 @@ def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
                 }
             )
 
+        # 일부 응답에 필요한 값이 없으면 해당 댓글만 건너뜁니다.
         except (KeyError, TypeError, ValueError):
             continue
 
@@ -173,7 +187,7 @@ def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
         reverse=True,
     )
 
-    # 표에 표시할 순위를 추가합니다.
+    # 정렬된 순서대로 순위를 추가합니다.
     for rank, comment in enumerate(comments, start=1):
         comment["순위"] = rank
 
@@ -181,11 +195,11 @@ def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
 
 
 # =========================================================
-# 댓글 단어 빈도 분석
+# 댓글에서 사용할 단어 추출
 # =========================================================
-def count_top_words(comments: list[dict], top_n: int = 20) -> pd.DataFrame:
+def extract_words(comments: list[dict]) -> list[str]:
     """
-    전체 댓글을 단어로 나눈 뒤 자주 등장한 단어를 계산합니다.
+    전체 댓글을 단어로 나눕니다.
 
     - 영문은 소문자로 통일합니다.
     - 한글, 영문, 숫자를 단어로 인식합니다.
@@ -199,7 +213,7 @@ def count_top_words(comments: list[dict], top_n: int = 20) -> pd.DataFrame:
         for comment in comments
     )
 
-    # 한글, 영문, 숫자로 이루어진 단어를 찾습니다.
+    # 한글, 영문, 숫자가 이어진 부분을 단어로 찾습니다.
     words = re.findall(
         r"[가-힣A-Za-z0-9]+",
         all_text.lower(),
@@ -212,19 +226,113 @@ def count_top_words(comments: list[dict], top_n: int = 20) -> pd.DataFrame:
         if len(word) <= 1:
             continue
 
-        # 숫자로만 이루어진 값도 제외합니다.
+        # 숫자로만 이루어진 값은 제외합니다.
         if word.isdigit():
             continue
 
         filtered_words.append(word)
 
-    # 가장 자주 등장한 단어를 지정된 개수만큼 계산합니다.
-    word_counts = Counter(filtered_words).most_common(top_n)
+    return filtered_words
+
+
+# =========================================================
+# 상위 단어 빈도 계산
+# =========================================================
+def count_top_words(
+    words: list[str],
+    top_n: int = 20,
+) -> pd.DataFrame:
+    """
+    단어 목록에서 가장 많이 등장한 단어를 계산합니다.
+    """
+
+    word_counts = Counter(words).most_common(top_n)
 
     return pd.DataFrame(
         word_counts,
         columns=["단어", "빈도"],
     )
+
+
+# =========================================================
+# 한글 폰트 내려받기
+# =========================================================
+@st.cache_resource
+def download_korean_font() -> tuple[str | None, str | None]:
+    """
+    GitHub에서 나눔고딕 폰트를 내려받아 임시 폴더에 저장합니다.
+
+    성공하면 폰트 경로와 None을 반환하고,
+    실패하면 None과 오류 안내 문구를 반환합니다.
+    """
+
+    try:
+        # 이미 정상적인 폰트 파일이 있으면 다시 받지 않습니다.
+        if FONT_PATH.exists() and FONT_PATH.stat().st_size > 10_000:
+            return str(FONT_PATH), None
+
+        response = requests.get(
+            FONT_URL,
+            timeout=20,
+        )
+
+        response.raise_for_status()
+
+        # 비어 있거나 지나치게 작은 파일은 정상 폰트로 보지 않습니다.
+        if len(response.content) <= 10_000:
+            return None, "내려받은 폰트 파일이 올바르지 않습니다."
+
+        FONT_PATH.write_bytes(response.content)
+
+        return str(FONT_PATH), None
+
+    except requests.exceptions.Timeout:
+        return None, (
+            "한글 폰트 서버의 응답이 늦어 "
+            "폰트를 내려받지 못했습니다."
+        )
+
+    except requests.exceptions.RequestException:
+        return None, (
+            "한글 폰트를 내려받지 못했습니다. "
+            "인터넷 연결 상태를 확인해 주세요."
+        )
+
+    except OSError:
+        return None, (
+            "내려받은 한글 폰트를 임시 저장 공간에 "
+            "저장하지 못했습니다."
+        )
+
+
+# =========================================================
+# 워드클라우드 이미지 만들기
+# =========================================================
+def create_wordcloud_image(
+    words: list[str],
+    font_path: str,
+):
+    """
+    단어 빈도를 이용해 워드클라우드 이미지를 만듭니다.
+
+    matplotlib은 사용하지 않고,
+    WordCloud의 to_image() 결과를 바로 반환합니다.
+    """
+
+    word_frequencies = Counter(words)
+
+    wordcloud = WordCloud(
+        font_path=font_path,
+        width=1200,
+        height=600,
+        background_color="white",
+        max_words=200,
+        collocations=False,
+        random_state=42,
+    ).generate_from_frequencies(word_frequencies)
+
+    # PIL 이미지 형태로 반환합니다.
+    return wordcloud.to_image()
 
 
 # =========================================================
@@ -399,20 +507,22 @@ if comments is not None:
     )
 
     if comments:
+        # 전체 댓글에서 분석에 사용할 단어를 한 번만 추출합니다.
+        words = extract_words(comments)
+
         # -------------------------------------------------
-        # 자주 등장한 단어 분석
+        # 자주 등장한 단어 상위 20개
         # -------------------------------------------------
         st.subheader("자주 등장한 단어")
 
         word_df = count_top_words(
-            comments=comments,
+            words=words,
             top_n=20,
         )
 
         if not word_df.empty:
-            # Plotly에서 가로 막대그래프를 만들기 위해
-            # 빈도가 작은 단어부터 배치합니다.
-            # 그러면 빈도가 가장 높은 단어가 그래프 위쪽에 표시됩니다.
+            # 가로 막대그래프에서는 작은 값부터 아래쪽에 배치하면
+            # 가장 많이 나온 단어가 위쪽에 표시됩니다.
             chart_df = word_df.sort_values(
                 "빈도",
                 ascending=True,
@@ -430,13 +540,11 @@ if comments is not None:
                 },
             )
 
-            # 막대 바깥쪽에 빈도 숫자를 표시합니다.
             fig.update_traces(
                 textposition="outside",
                 cliponaxis=False,
             )
 
-            # 그래프 높이와 여백을 조정합니다.
             fig.update_layout(
                 height=620,
                 margin=dict(
@@ -465,6 +573,54 @@ if comments is not None:
         else:
             st.info(
                 "댓글에서 분석할 수 있는 단어를 찾지 못했습니다."
+            )
+
+        # -------------------------------------------------
+        # 워드클라우드
+        # -------------------------------------------------
+        st.subheader("워드클라우드")
+
+        if words:
+            # 한글이 깨지지 않도록 나눔고딕 폰트를 내려받습니다.
+            font_path, font_error = download_korean_font()
+
+            if font_path is None:
+                st.warning(
+                    font_error
+                    or "한글 폰트를 내려받지 못해 워드클라우드를 만들 수 없습니다."
+                )
+
+            else:
+                try:
+                    wordcloud_image = create_wordcloud_image(
+                        words=words,
+                        font_path=font_path,
+                    )
+
+                    # matplotlib 없이 PIL 이미지를 바로 표시합니다.
+                    st.image(
+                        wordcloud_image,
+                        use_container_width=True,
+                    )
+
+                    st.caption(
+                        "댓글 전체에서 추출한 단어로 만든 워드클라우드입니다. "
+                        "한 글자 단어와 숫자로만 이루어진 값은 제외했습니다."
+                    )
+
+                except ValueError:
+                    st.info(
+                        "워드클라우드를 만들 수 있는 단어가 충분하지 않습니다."
+                    )
+
+                except Exception:
+                    st.error(
+                        "워드클라우드 이미지를 만드는 중 오류가 발생했습니다."
+                    )
+
+        else:
+            st.info(
+                "워드클라우드를 만들 수 있는 단어가 없습니다."
             )
 
         # -------------------------------------------------
