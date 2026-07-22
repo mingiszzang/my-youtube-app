@@ -8,6 +8,8 @@ import plotly.express as px
 import requests
 import streamlit as st
 from wordcloud import WordCloud
+import numpy as np
+from PIL import Image
 
 
 # =========================================================
@@ -308,31 +310,90 @@ def download_korean_font() -> tuple[str | None, str | None]:
 # =========================================================
 # 워드클라우드 이미지 만들기
 # =========================================================
+# =========================================================
+# 원형 워드클라우드 이미지 만들기
+# =========================================================
 def create_wordcloud_image(
     words: list[str],
     font_path: str,
 ):
     """
-    단어 빈도를 이용해 워드클라우드 이미지를 만듭니다.
+    단어 빈도를 이용해 원 모양 워드클라우드를 만듭니다.
 
-    matplotlib은 사용하지 않고,
-    WordCloud의 to_image() 결과를 바로 반환합니다.
+    - 흰색 배경
+    - 원형 배치
+    - 300 DPI 정보 적용
+    - matplotlib은 사용하지 않음
     """
 
     word_frequencies = Counter(words)
 
+    # -----------------------------------------------------
+    # 원형 마스크 만들기
+    # -----------------------------------------------------
+    # 1800 x 1800 픽셀 정사각형 이미지로 만듭니다.
+    # 화면에 표시하기에도 충분히 선명하고,
+    # 300 DPI 기준으로는 약 6인치 크기입니다.
+    image_size = 1800
+
+    # 각 픽셀의 x, y 좌표를 만듭니다.
+    y, x = np.ogrid[
+        :image_size,
+        :image_size,
+    ]
+
+    center = image_size // 2
+
+    # 원의 가장자리가 잘리지 않도록 약간의 여백을 둡니다.
+    radius = int(image_size * 0.47)
+
+    # 원의 바깥쪽은 255, 안쪽은 0으로 설정합니다.
+    # WordCloud에서는 255인 영역에 단어가 배치되지 않습니다.
+    circle_mask = (
+        (x - center) ** 2
+        + (y - center) ** 2
+        > radius ** 2
+    )
+
+    mask = np.zeros(
+        (image_size, image_size),
+        dtype=np.uint8,
+    )
+
+    mask[circle_mask] = 255
+
+    # -----------------------------------------------------
+    # 워드클라우드 생성
+    # -----------------------------------------------------
     wordcloud = WordCloud(
         font_path=font_path,
-        width=1200,
-        height=600,
+        width=image_size,
+        height=image_size,
+        mask=mask,
         background_color="white",
+        mode="RGB",
         max_words=200,
         collocations=False,
         random_state=42,
+
+        # 단어가 너무 빽빽하게 붙지 않도록 여백을 줍니다.
+        margin=3,
+
+        # 원 안을 최대한 채우도록 크기 조정을 반복합니다.
+        max_font_size=260,
+        min_font_size=12,
+        prefer_horizontal=0.85,
     ).generate_from_frequencies(word_frequencies)
 
-    # PIL 이미지 형태로 반환합니다.
-    return wordcloud.to_image()
+    # matplotlib 없이 PIL 이미지로 변환합니다.
+    image = wordcloud.to_image()
+
+    # DPI 정보를 300으로 지정합니다.
+    # 화면 표시 해상도는 픽셀 수에 의해 결정되고,
+    # DPI 정보는 저장·인쇄 시 활용됩니다.
+    image.info["dpi"] = (300, 300)
+
+    return image
 
 
 # =========================================================
