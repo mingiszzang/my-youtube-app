@@ -1,7 +1,9 @@
 import re
+from collections import Counter
 from urllib.parse import urlparse, parse_qs
 
 import pandas as pd
+import plotly.express as px
 import requests
 import streamlit as st
 
@@ -26,9 +28,9 @@ YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/commentThreads"
 # =========================================================
 def extract_video_id(url: str) -> str | None:
     """
-    여러 형태의 유튜브 주소에서 11자리 영상 ID를 추출합니다.
+    유튜브 주소에서 11자리 영상 ID를 추출합니다.
 
-    처리 가능한 예:
+    처리 가능한 주소 예시
     - https://youtu.be/영상ID
     - https://www.youtube.com/watch?v=영상ID
     - https://youtube.com/shorts/영상ID
@@ -38,33 +40,29 @@ def extract_video_id(url: str) -> str | None:
     if not url:
         return None
 
-    # 사용자가 입력한 주소 앞뒤의 공백을 제거합니다.
     url = url.strip()
 
     try:
         parsed_url = urlparse(url)
+        domain = parsed_url.netloc.lower()
+        path = parsed_url.path.strip("/")
 
-        # 1. youtu.be 짧은 주소
-        # 예: https://youtu.be/d95J8yzvjbQ?si=...
-        if parsed_url.netloc.lower() in {"youtu.be", "www.youtu.be"}:
-            video_id = parsed_url.path.strip("/").split("/")[0]
+        # youtu.be 형식의 짧은 주소
+        if domain in {"youtu.be", "www.youtu.be"}:
+            video_id = path.split("/")[0]
 
-        # 2. youtube.com 주소
-        elif parsed_url.netloc.lower() in {
+        # youtube.com 형식의 주소
+        elif domain in {
             "youtube.com",
             "www.youtube.com",
             "m.youtube.com",
             "music.youtube.com",
         }:
-            path = parsed_url.path.strip("/")
-
             # 일반 영상 주소
-            # 예: https://www.youtube.com/watch?v=d95J8yzvjbQ
             if path == "watch":
                 video_id = parse_qs(parsed_url.query).get("v", [None])[0]
 
-            # Shorts 또는 임베드 주소도 함께 처리합니다.
-            # 예: youtube.com/shorts/영상ID
+            # Shorts, 라이브, 임베드 주소
             elif path.startswith(("shorts/", "embed/", "live/")):
                 parts = path.split("/")
                 video_id = parts[1] if len(parts) >= 2 else None
@@ -75,7 +73,7 @@ def extract_video_id(url: str) -> str | None:
         else:
             video_id = None
 
-        # 유튜브 영상 ID는 일반적으로 영문, 숫자, -, _로 된 11자리입니다.
+        # 유튜브 영상 ID가 올바른 11자리인지 확인합니다.
         if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
             return video_id
 
@@ -90,8 +88,8 @@ def extract_video_id(url: str) -> str | None:
 # =========================================================
 def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
     """
-    YouTube Data API v3의 commentThreads 창구를 이용하여
-    상위 댓글을 최대 100개 가져옵니다.
+    YouTube Data API v3를 이용해
+    최상위 댓글을 최대 100개 가져옵니다.
     """
 
     params = {
@@ -103,14 +101,13 @@ def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
         "key": api_key,
     }
 
-    # 네트워크가 무한정 대기하지 않도록 timeout을 설정합니다.
     response = requests.get(
         YOUTUBE_API_URL,
         params=params,
         timeout=15,
     )
 
-    # API가 오류를 반환한 경우 오류 내용을 확인합니다.
+    # API가 오류를 반환한 경우 오류 원인을 확인합니다.
     if response.status_code != 200:
         error_reason = ""
         error_message = ""
@@ -126,19 +123,16 @@ def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
         except ValueError:
             pass
 
-        # 댓글 사용이 중지된 영상
         if error_reason == "commentsDisabled":
             raise ValueError(
                 "이 영상은 댓글 사용이 중지되어 있어 댓글을 가져올 수 없습니다."
             )
 
-        # 존재하지 않거나 비공개인 영상
         if error_reason in {"videoNotFound", "forbidden"}:
             raise ValueError(
                 "영상을 찾을 수 없습니다. 비공개 또는 삭제된 영상인지 확인해 주세요."
             )
 
-        # API 키 또는 할당량 관련 오류
         if error_reason in {
             "keyInvalid",
             "quotaExceeded",
@@ -146,7 +140,8 @@ def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
             "accessNotConfigured",
         }:
             raise ValueError(
-                "YouTube API 설정에 문제가 있습니다. API 키 또는 사용량 한도를 확인해 주세요."
+                "YouTube API 설정에 문제가 있습니다. "
+                "API 키 또는 사용량 한도를 확인해 주세요."
             )
 
         raise ValueError(
@@ -157,7 +152,7 @@ def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
     data = response.json()
     comments = []
 
-    # API 응답의 각 댓글 스레드에서 최상위 댓글 정보를 꺼냅니다.
+    # 각 댓글 스레드에서 최상위 댓글 정보를 꺼냅니다.
     for item in data.get("items", []):
         try:
             snippet = item["snippet"]["topLevelComment"]["snippet"]
@@ -169,22 +164,67 @@ def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
                 }
             )
 
-        # 일부 응답에 예상한 필드가 없다면 해당 항목만 건너뜁니다.
         except (KeyError, TypeError, ValueError):
             continue
 
-    # API는 relevance 순으로 반환하지만,
-    # 화면에는 좋아요가 많은 순서대로 다시 정렬합니다.
+    # 좋아요가 많은 순서로 정렬합니다.
     comments.sort(
         key=lambda comment: comment["좋아요"],
         reverse=True,
     )
 
-    # 정렬된 순서대로 순위 번호를 추가합니다.
+    # 표에 표시할 순위를 추가합니다.
     for rank, comment in enumerate(comments, start=1):
         comment["순위"] = rank
 
     return comments
+
+
+# =========================================================
+# 댓글 단어 빈도 분석
+# =========================================================
+def count_top_words(comments: list[dict], top_n: int = 20) -> pd.DataFrame:
+    """
+    전체 댓글을 단어로 나눈 뒤 자주 등장한 단어를 계산합니다.
+
+    - 영문은 소문자로 통일합니다.
+    - 한글, 영문, 숫자를 단어로 인식합니다.
+    - 한 글자 단어는 제외합니다.
+    - 숫자로만 이루어진 단어는 제외합니다.
+    """
+
+    # 모든 댓글을 하나의 긴 문자열로 합칩니다.
+    all_text = " ".join(
+        comment.get("댓글", "")
+        for comment in comments
+    )
+
+    # 한글, 영문, 숫자로 이루어진 단어를 찾습니다.
+    words = re.findall(
+        r"[가-힣A-Za-z0-9]+",
+        all_text.lower(),
+    )
+
+    filtered_words = []
+
+    for word in words:
+        # 한 글자짜리 단어는 제외합니다.
+        if len(word) <= 1:
+            continue
+
+        # 숫자로만 이루어진 값도 제외합니다.
+        if word.isdigit():
+            continue
+
+        filtered_words.append(word)
+
+    # 가장 자주 등장한 단어를 지정된 개수만큼 계산합니다.
+    word_counts = Counter(filtered_words).most_common(top_n)
+
+    return pd.DataFrame(
+        word_counts,
+        columns=["단어", "빈도"],
+    )
 
 
 # =========================================================
@@ -193,7 +233,7 @@ def fetch_youtube_comments(video_id: str, api_key: str) -> list[dict]:
 def set_example_url(url: str):
     st.session_state.youtube_url = url
 
-    # 새로운 주소를 선택하면 이전 분석 결과는 지웁니다.
+    # 다른 영상을 선택하면 이전 분석 결과를 지웁니다.
     st.session_state.comments = None
     st.session_state.analyzed_video_id = None
 
@@ -217,13 +257,13 @@ if "analyzed_video_id" not in st.session_state:
 st.title("💬 유튜브 댓글 분석")
 
 st.write(
-    "유튜브 영상 링크를 입력하면 좋아요가 많은 댓글을 "
-    "최대 100개까지 가져옵니다."
+    "유튜브 영상 링크를 입력하면 댓글을 최대 100개까지 가져와 "
+    "댓글 내용과 자주 등장한 단어를 분석합니다."
 )
 
 st.subheader("예시 영상")
 
-# 두 개의 버튼을 가로로 나란히 배치합니다.
+# 예시 버튼 두 개를 가로로 배치합니다.
 example_col1, example_col2 = st.columns(2)
 
 with example_col1:
@@ -243,8 +283,7 @@ with example_col2:
     )
 
 
-# 입력창과 분석 버튼을 하나의 form으로 묶습니다.
-# 이렇게 하면 주소를 입력하는 도중에는 앱이 계속 재실행되지 않습니다.
+# 링크 입력창과 실행 버튼을 하나의 form으로 묶습니다.
 with st.form("youtube_comment_form"):
     st.text_input(
         "유튜브 영상 링크",
@@ -260,7 +299,7 @@ with st.form("youtube_comment_form"):
 
 
 # =========================================================
-# 분석 버튼을 눌렀을 때 실행
+# 댓글 가져오기 실행
 # =========================================================
 if submitted:
     video_id = extract_video_id(st.session_state.youtube_url)
@@ -275,7 +314,7 @@ if submitted:
         )
 
     else:
-        # Streamlit Cloud의 Secrets에서 API 키를 불러옵니다.
+        # Streamlit Cloud Secrets에서 API 키를 불러옵니다.
         try:
             api_key = st.secrets["YOUTUBE_API_KEY"]
         except (KeyError, FileNotFoundError):
@@ -351,7 +390,7 @@ comments = st.session_state.comments
 
 if comments is not None:
     st.divider()
-    st.subheader("분석 결과")
+    st.header("분석 결과")
 
     # 가져온 댓글 개수를 큰 지표 카드로 표시합니다.
     st.metric(
@@ -360,10 +399,81 @@ if comments is not None:
     )
 
     if comments:
-        # 판다스 데이터프레임으로 변환합니다.
+        # -------------------------------------------------
+        # 자주 등장한 단어 분석
+        # -------------------------------------------------
+        st.subheader("자주 등장한 단어")
+
+        word_df = count_top_words(
+            comments=comments,
+            top_n=20,
+        )
+
+        if not word_df.empty:
+            # Plotly에서 가로 막대그래프를 만들기 위해
+            # 빈도가 작은 단어부터 배치합니다.
+            # 그러면 빈도가 가장 높은 단어가 그래프 위쪽에 표시됩니다.
+            chart_df = word_df.sort_values(
+                "빈도",
+                ascending=True,
+            )
+
+            fig = px.bar(
+                chart_df,
+                x="빈도",
+                y="단어",
+                orientation="h",
+                text="빈도",
+                labels={
+                    "빈도": "등장 횟수",
+                    "단어": "",
+                },
+            )
+
+            # 막대 바깥쪽에 빈도 숫자를 표시합니다.
+            fig.update_traces(
+                textposition="outside",
+                cliponaxis=False,
+            )
+
+            # 그래프 높이와 여백을 조정합니다.
+            fig.update_layout(
+                height=620,
+                margin=dict(
+                    l=20,
+                    r=50,
+                    t=20,
+                    b=20,
+                ),
+                yaxis={
+                    "categoryorder": "total ascending",
+                },
+                showlegend=False,
+            )
+
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                key="word_frequency_chart",
+            )
+
+            st.caption(
+                "전체 댓글을 공백과 문장부호를 기준으로 나눈 뒤, "
+                "한 글자 단어와 숫자로만 이루어진 값은 제외했습니다."
+            )
+
+        else:
+            st.info(
+                "댓글에서 분석할 수 있는 단어를 찾지 못했습니다."
+            )
+
+        # -------------------------------------------------
+        # 댓글 목록
+        # -------------------------------------------------
+        st.subheader("댓글 목록")
+
         comments_df = pd.DataFrame(comments)
 
-        # 표에 표시할 열 순서를 지정합니다.
         comments_df = comments_df[
             [
                 "순위",
